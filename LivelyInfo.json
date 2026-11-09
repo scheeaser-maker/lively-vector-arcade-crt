@@ -1,0 +1,14 @@
+{
+  "AppVersion": "2.0.6.1",
+  "Title": "Stéroïdes CRT",
+  "Thumbnail": "thumbnail.jpg",
+  "Preview": null,
+  "Desc": "Borne d'arcade vectorielle façon 1979 sur tube cathodique : rochers filaires à la dérive, faisceau lumineux, halo et rémanence du phosphore. Démo jouée automatiquement.",
+  "Author": "Arnaud Scheenaerts",
+  "License": "Usage personnel",
+  "Contact": "",
+  "Type": 1,
+  "FileName": "index.html",
+  "Arguments": null,
+  "IsAbsolutePath": false
+}

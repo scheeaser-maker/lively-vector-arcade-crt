@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Stéroïdes CRT</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  body.centre { background: radial-gradient(ellipse at center, #1c1c1f 0%, #0b0b0d 50%, #050506 100%); }
+  #bezel { position: absolute; display: none; background: #020202; border-radius: 10px;
+           box-shadow: 0 0 0 1px #151517, 0 20px 60px rgba(0,0,0,.7); }
+  body.centre #bezel { display: block; }
+  #crt { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<div id="bezel"></div>
+<canvas id="crt"></canvas>
+<script>
+'use strict';
+
+/* ================= Options (pilotées par Lively) ================= */
+const opts = { mode: 0, bright: 1.0, halo: 1.0, curv: 0.5, col: [0.86, 0.93, 1.0], refl: 1, speed: 1.0, persist: 0.5, title: 1 };
+
+function hexToRgb(h) {
+  h = String(h).replace('#', '');
+  return [0, 2, 4].map(i => parseInt(h.substr(i, 2), 16) / 255);
+}
+
+// Appelée par Lively au chargement puis à chaque changement de réglage
+function livelyPropertyListener(name, val) {
+  switch (name) {
+    case 'affichage':   if (opts.mode !== val) { opts.mode = val; setupMode(); } break;
+    case 'luminosite':  opts.bright = val / 100; break;
+    case 'halo':        opts.halo = val / 100; break;
+    case 'courbure':    opts.curv = val / 100; break;
+    case 'couleurTrace': opts.col = hexToRgb(val); break;
+    case 'remanence':   opts.persist = val / 100; break;
+    case 'reflet':      opts.refl = val ? 1 : 0; break;
+    case 'titre':       opts.title = val ? 1 : 0; break;
+    case 'vitesse':     opts.speed = val / 100; break;
+  }
+}
+
+/* ================= Police vectorielle (grille 4 x 6) ================= */
+const BOX = [0,0,4,0,4,6,0,6,0,0];
+const VF = {
+  '0': [BOX], '1': [[2,0,2,6]], '2': [[0,0,4,0,4,3,0,3,0,6,4,6]], '3': [[0,0,4,0,4,6,0,6],[0,3,4,3]],
+  '4': [[0,0,0,3,4,3],[4,0,4,6]], '5': [[4,0,0,0,0,3,4,3,4,6,0,6]], '6': [[4,0,0,0,0,6,4,6,4,3,0,3]],
+  '7': [[0,0,4,0,4,6]], '8': [BOX,[0,3,4,3]], '9': [[4,3,0,3,0,0,4,0,4,6,0,6]],
+  A: [[0,6,0,2,2,0,4,2,4,6],[0,4,4,4]], D: [[0,0,2,0,4,2,4,4,2,6,0,6,0,0]], E: [[4,0,0,0,0,6,4,6],[0,3,3,3]],
+  G: [[4,1,4,0,0,0,0,6,4,6,4,3,2,3]], I: [[0,0,4,0],[2,0,2,6],[0,6,4,6]], M: [[0,6,0,0,2,3,4,0,4,6]],
+  O: [BOX], P: [[0,6,0,0,4,0,4,3,0,3]], R: [[0,6,0,0,4,0,4,3,0,3],[1,3,4,6]], S: [[4,0,0,0,0,3,4,3,4,6,0,6]],
+  T: [[0,0,4,0],[2,0,2,6]], V: [[0,0,2,6,4,0]],
+};
+
+/* ================= Écran logique et surfaces ================= */
+let W = 640, H = 480, K = 1, rect = [0, 0, 1, 1];
+const cS = document.createElement('canvas'), ctx = cS.getContext('2d');
+const blurC = [0, 1].map(() => { const c = document.createElement('canvas'); return { c, x: c.getContext('2d'), r: 1 }; });
+
+function poly(pts, x, y, s, close) {          // polyligne en coordonnées logiques
+  ctx.beginPath();
+  for (let i = 0; i < pts.length; i += 2) ctx[i ? 'lineTo' : 'moveTo'](x + pts[i] * s, y + pts[i + 1] * s);
+  if (close) ctx.closePath();
+  ctx.stroke();
+}
+function shape(pts, x, y, a, s, close) {      // forme tournée
+  const c = Math.cos(a) * s, n = Math.sin(a) * s;
+  ctx.beginPath();
+  for (let i = 0; i < pts.length; i += 2) {
+    const px = x + pts[i] * c - pts[i + 1] * n, py = y + pts[i] * n + pts[i + 1] * c;
+    ctx[i ? 'lineTo' : 'moveTo'](px, py);
+  }
+  if (close) ctx.closePath();
+  ctx.stroke();
+}
+function dot(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832); ctx.fill(); }
+function text(t, x, y, s) {
+  for (let k = 0; k < t.length; k++) { const g = VF[t[k]]; if (g) for (const p of g) poly(p, x + k * 6 * s, y, s); }
+}
+const textW = (t, s) => (t.length * 6 - 2) * s;
+
+/* ================= Rendu WebGL (tube cathodique vectoriel) ================= */
+const cv = document.getElementById('crt');
+const gl = cv.getContext('webgl', { alpha: true, premultipliedAlpha: true, antialias: false });
+const VSH = 'attribute vec2 a;void main(){gl_Position=vec4(a,0.0,1.0);}';
+const FSH = `precision highp float;
+uniform sampler2D uS,uA,uB; uniform vec4 uRect;
+uniform float uBright,uHalo,uCurv,uRefl,uTime; uniform vec3 uCol;
+void main(){
+  vec2 uv=(gl_FragCoord.xy-uRect.xy)/uRect.zw; uv.y=1.0-uv.y;
+  vec2 p=uv*2.0-1.0; float r2=dot(p,p);
+  vec2 q=p*(1.0+uCurv*0.14*r2);
+  float m=clamp((1.0-(pow(abs(q.x),12.0)+pow(abs(q.y),12.0)))*25.0,0.0,1.0);
+  vec2 t=q*0.5+0.5;
+  float s=max(texture2D(uS,t).r-0.03,0.0);
+  float h=1.1*texture2D(uA,t).r+1.3*texture2D(uB,t).r;
+  float fl=0.97+0.03*sin(uTime*53.0);
+  float g=(2.2*s+uHalo*h)*uBright*fl;
+  float lum=1.0-exp(-1.5*g);
+  vec3 rgb=lum*mix(uCol,vec3(1.0),clamp(s*s*0.75,0.0,1.0))+uCol*0.034*uBright;
+  rgb*=clamp(1.0-0.32*pow(r2,1.4),0.0,1.0);
+  rgb+=uRefl*0.06*exp(-((p.x+0.45)*(p.x+0.45)/0.12+(p.y+0.55)*(p.y+0.55)/0.05));
+  float n=fract(sin(dot(gl_FragCoord.xy+fract(uTime)*61.0,vec2(12.9898,78.233)))*43758.5453);
+  rgb=clamp(rgb+(n-0.5)*0.014,0.0,1.0);
+  gl_FragColor=vec4(rgb*m,m);
+}`;
+function sh(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s); return s; }
+const prog = gl.createProgram();
+gl.attachShader(prog, sh(gl.VERTEX_SHADER, VSH)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FSH));
+gl.linkProgram(prog); gl.useProgram(prog);
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+const aLoc = gl.getAttribLocation(prog, 'a'); gl.enableVertexAttribArray(aLoc);
+gl.vertexAttribPointer(aLoc, 2, gl.FLOAT, false, 0, 0);
+const U = {}; ['uS','uA','uB','uRect','uBright','uHalo','uCurv','uRefl','uTime','uCol']
+  .forEach(n => U[n] = gl.getUniformLocation(prog, n));
+const tex = [0, 1, 2].map(i => { const t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + i);
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t; });
+gl.uniform1i(U.uS, 0); gl.uniform1i(U.uA, 1); gl.uniform1i(U.uB, 2);
+
+/* ================= Mise en place selon le mode ================= */
+function setupMode() {
+  const dpr = window.devicePixelRatio || 1;
+  const cw = Math.round(innerWidth * dpr), ch = Math.round(innerHeight * dpr);
+  cv.width = cw; cv.height = ch;
+  document.body.classList.toggle('centre', opts.mode === 1);
+  H = 480;
+  if (opts.mode === 1) {                 // écran 4:3 de borne, centré
+    W = 640;
+    let h = Math.round(ch * 0.92), w = Math.round(h * 4 / 3);
+    if (w > cw * 0.96) { w = Math.round(cw * 0.96); h = Math.round(w * 3 / 4); }
+    rect = [Math.round((cw - w) / 2), Math.round((ch - h) / 2), w, h];
+    const b = document.getElementById('bezel'), m = 12;
+    Object.assign(b.style, { left: (rect[0] / dpr - m) + 'px', top: (rect[1] / dpr - m) + 'px',
+      width: (w / dpr + 2 * m) + 'px', height: (h / dpr + 2 * m) + 'px' });
+  } else {                               // étiré sur tout l'écran
+    W = Math.max(480, Math.round(H * cw / ch));
+    rect = [0, 0, cw, ch];
+  }
+  const sh2 = Math.max(240, Math.min(rect[3], 1080));
+  K = sh2 / H;
+  cS.width = Math.round(W * K); cS.height = sh2;
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cS.width, cS.height);
+  blurC.forEach((b, i) => { b.c.width = Math.ceil(cS.width / 4); b.c.height = Math.ceil(sh2 / 4);
+    b.r = (i ? 7 : 1.6) * sh2 / 1080 + (i ? 1 : 0.4); });
+  newGame();
+}
+
+/* ================= Le jeu (démo automatique) ================= */
+const TURN = 3.0, THRUST = 150, BS = 380, BLIFE = 0.85;
+const RSIZE = [38, 20, 10], RPTS = [20, 50, 100];
+const SHIP = [11,0, -8,7, -4,0, -8,-7], FLAME = [-5,3, -13,0, -5,-3];
+const PROBE = [[-13,0, -5,-6, 5,-6, 13,0, 5,6, -5,6, -13,0, 13,0], [-3,-6, -5,-12], [3,-6, 5,-12]];
+let G, TOP = 12500;
+const rnd = (a, b) => a + Math.random() * (b - a);
+const wrapD = (d, S) => ((d + S / 2) % S + S) % S - S / 2;
+const wrapA = a => Math.atan2(Math.sin(a), Math.cos(a));
+
+function newGame() {
+  G = { score: 0, lives: 3, wave: 0, t: 0, over: 0, rocks: [], bul: [], ebul: [], parts: [], debris: [],
+        probe: null, probeT: rnd(14, 24), waveDelay: 0, ship: null, dead: 0, cruise: 2 };
+  spawnShip(); newWave();
+}
+function mkRock(size, x, y, dir) {
+  const r = RSIZE[size], n = 9 + (Math.random() * 4 | 0), pts = [];
+  const dent = Math.random() * n | 0;
+  for (let i = 0; i < n; i++) {
+    const a = i / n * 6.2832 + rnd(-0.18, 0.18), d = r * (i === dent ? rnd(0.45, 0.6) : rnd(0.72, 1.12));
+    pts.push(Math.cos(a) * d, Math.sin(a) * d);
+  }
+  const sp = rnd(18, 34) * (1 + size * 0.75) * (1 + 0.12 * Math.min(G.wave, 10));
+  if (dir === undefined) dir = rnd(0, 6.2832);
+  return { size, r, x, y, vx: Math.cos(dir) * sp, vy: Math.sin(dir) * sp, a: rnd(0, 6.28), va: rnd(-0.5, 0.5), pts };
+}
+function newWave() {
+  G.wave++;
+  const n = Math.round((4 + Math.min(G.wave, 5)) * Math.max(1, W / 720));
+  for (let i = 0; i < n; i++) {
+    let x, y, tries = 0;
+    do { if (Math.random() < 0.5) { x = rnd(0, W); y = Math.random() < 0.5 ? rnd(0, 50) : rnd(H - 50, H); }
+         else { x = Math.random() < 0.5 ? rnd(0, 60) : rnd(W - 60, W); y = rnd(0, H); }
+    } while (G.ship && Math.hypot(x - G.ship.x, y - G.ship.y) < 160 && ++tries < 20);
+    G.rocks.push(mkRock(0, x, y));
+  }
+}
+function spawnShip() { G.ship = { x: W / 2, y: H / 2, vx: 0, vy: 0, a: -Math.PI / 2, thr: false, cool: 0.5, safe: 1.6 }; G.dead = 0; }
+
+function boom(x, y, n, sp, life) {
+  for (let i = 0; i < n; i++) { const a = rnd(0, 6.2832), v = rnd(0.25, 1) * sp;
+    G.parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, t: rnd(0.4, 1) * life, l: life }); }
+}
+function hitRock(i, scored) {
+  const r = G.rocks[i]; G.rocks.splice(i, 1);
+  if (scored) G.score += RPTS[r.size];
+  boom(r.x, r.y, 7 + (2 - r.size) * 4, 60 + r.size * 15, 0.9);
+  if (r.size < 2) { const d = Math.atan2(r.vy, r.vx);
+    G.rocks.push(mkRock(r.size + 1, r.x, r.y, d + rnd(0.3, 1.2)), mkRock(r.size + 1, r.x, r.y, d - rnd(0.3, 1.2))); }
+}
+function killShip() {
+  const s = G.ship; if (!s) return;
+  boom(s.x, s.y, 14, 90, 1.2);
+  for (let i = 0; i < 4; i++) { const j = i * 2, k = (j + 2) % 8, a = rnd(0, 6.2832), v = rnd(12, 40);
+    const c = Math.cos(s.a), n = Math.sin(s.a);
+    G.debris.push({ x: s.x, y: s.y, vx: s.vx * 0.4 + Math.cos(a) * v, vy: s.vy * 0.4 + Math.sin(a) * v, a: 0, va: rnd(-3, 3), t: 1.8,
+      p: [SHIP[j] * c - SHIP[j + 1] * n, SHIP[j] * n + SHIP[j + 1] * c, SHIP[k] * c - SHIP[k + 1] * n, SHIP[k] * n + SHIP[k + 1] * c] }); }
+  G.ship = null; G.lives--; G.dead = 2.2;
+}
+
+function pilot(dt) {                         // pilote automatique
+  const s = G.ship;
+  let tgt = null, best = 1e9, danger = null, dT = 1e9, info = null;
+  const list = G.probe ? G.rocks.concat([G.probe]) : G.rocks;
+  for (const c of list) {
+    const px = wrapD(c.x - s.x, W), py = wrapD(c.y - s.y, H), vx = c.vx - s.vx, vy = c.vy - s.vy;
+    const d = Math.hypot(px, py), v2 = vx * vx + vy * vy;
+    const tca = v2 > 1 ? Math.max(0, Math.min(2.5, -(px * vx + py * vy) / v2)) : 0;
+    const miss = Math.hypot(px + vx * tca, py + vy * tca);
+    const o = { c, px, py, vx, vy, d };
+    if (miss < c.r + 10 && tca < dT) { danger = o; dT = tca; }
+    const sc = d - (c.r < 15 ? 30 : 0);
+    if (sc < best) { best = sc; tgt = o; }
+  }
+  info = danger || tgt;
+  s.thr = false;
+  G.cruise -= dt;
+  if (!info) { if (G.cruise < 0.5 && G.cruise > 0) s.thr = true; if (G.cruise < 0) G.cruise = rnd(2, 5); return; }
+  let t = info.d / BS, ax = info.px, ay = info.py;
+  for (let k = 0; k < 2; k++) { ax = info.px + info.vx * t; ay = info.py + info.vy * t; t = Math.hypot(ax, ay) / BS; }
+  const diff = wrapA(Math.atan2(ay, ax) - s.a);
+  s.a += Math.max(-TURN * dt, Math.min(TURN * dt, diff));
+  const dist = Math.hypot(ax, ay);
+  if (Math.abs(diff) < Math.max(0.035, Math.atan(info.c.r * 0.55 / dist)) && dist < BS * BLIFE * 0.95 && s.cool <= 0 && G.bul.length < 4) {
+    const fa = s.a + rnd(-0.07, 0.07);            // légère imprécision, comme un vrai joueur
+    G.bul.push({ x: s.x + Math.cos(s.a) * 11, y: s.y + Math.sin(s.a) * 11, vx: Math.cos(fa) * BS + s.vx, vy: Math.sin(fa) * BS + s.vy, t: BLIFE });
+    s.cool = rnd(0.3, 0.55);
+  }
+  const speed = Math.hypot(s.vx, s.vy);
+  if (!danger) {
+    if (info.d > 230 && Math.abs(diff) < 0.3 && speed < 75) s.thr = true;            // se rapprocher
+    else if (G.cruise < 0.45 && speed < 60 && info.d > 120) s.thr = true;             // petite impulsion
+    if (G.cruise < 0) G.cruise = rnd(1.5, 4);
+  } else if (info.d < info.c.r + 60 && Math.cos(s.a) * info.px + Math.sin(s.a) * info.py < 0) s.thr = true;  // fuite
+}
+
+function update(dt) {
+  G.t += dt;
+  const wrap = o => { o.x = (o.x % W + W) % W; o.y = (o.y % H + H) % H; };
+  for (const p of G.parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.t -= dt; }
+  G.parts = G.parts.filter(p => p.t > 0);
+  for (const d of G.debris) { d.x += d.vx * dt; d.y += d.vy * dt; d.a += d.va * dt; d.t -= dt; }
+  G.debris = G.debris.filter(d => d.t > 0);
+  for (const r of G.rocks) { r.x += r.vx * dt; r.y += r.vy * dt; r.a += r.va * dt; wrap(r); }
+  if (G.over > 0) { G.over -= dt; if (G.over <= 0) newGame(); return; }
+
+  // vaisseau
+  const s = G.ship;
+  if (s) {
+    s.cool -= dt; s.safe -= dt;
+    pilot(dt);
+    if (s.thr) { s.vx += Math.cos(s.a) * THRUST * dt; s.vy += Math.sin(s.a) * THRUST * dt; }
+    const f = Math.exp(-0.35 * dt); s.vx *= f; s.vy *= f;
+    const sp = Math.hypot(s.vx, s.vy); if (sp > 170) { s.vx *= 170 / sp; s.vy *= 170 / sp; }
+    s.x += s.vx * dt; s.y += s.vy * dt; wrap(s);
+  } else {
+    G.dead -= dt;
+    if (G.dead <= 0) {
+      if (G.lives <= 0) { G.over = 4.5; return; }
+      if (!G.rocks.some(r => Math.hypot(r.x - W / 2, r.y - H / 2) < r.r + 90)) spawnShip();
+    }
+  }
+
+  // sonde ennemie
+  if (!G.probe) {
+    G.probeT -= dt;
+    if (G.probeT <= 0 && G.rocks.length) { const dir = Math.random() < 0.5 ? 1 : -1;
+      G.probe = { x: dir > 0 ? 1 : W - 1, y: rnd(60, H - 60), vx: dir * 72, vy: 0, r: 12, zig: 1, fire: 1.2, life: W / 72 + 0.5 }; }
+  } else {
+    const p = G.probe; p.zig -= dt; p.fire -= dt; p.life -= dt;
+    if (p.zig <= 0) { p.zig = rnd(0.7, 1.6); p.vy = [-55, 0, 55][Math.random() * 3 | 0]; }
+    p.x += p.vx * dt; p.y = ((p.y + p.vy * dt) % H + H) % H;
+    if (p.fire <= 0) { p.fire = rnd(1.0, 1.7);
+      const a = G.ship ? Math.atan2(wrapD(G.ship.y - p.y, H), wrapD(G.ship.x - p.x, W)) + rnd(-0.6, 0.6) : rnd(0, 6.2832);
+      G.ebul.push({ x: p.x, y: p.y, vx: Math.cos(a) * 190, vy: Math.sin(a) * 190, t: 1.5 }); }
+    if (p.life <= 0) { G.probe = null; G.probeT = rnd(16, 30); }
+  }
+  const killProbe = pts => { const p = G.probe; boom(p.x, p.y, 16, 100, 1.0); G.score += pts; G.probe = null; G.probeT = rnd(16, 30); };
+
+  // tirs
+  for (const b of G.bul) { b.x += b.vx * dt; b.y += b.vy * dt; b.t -= dt; wrap(b); }
+  for (const b of G.ebul) { b.x += b.vx * dt; b.y += b.vy * dt; b.t -= dt; wrap(b); }
+  const near = (a, b, d) => Math.hypot(wrapD(a.x - b.x, W), wrapD(a.y - b.y, H)) < d;
+  for (const b of G.bul) {
+    if (b.t <= 0) continue;
+    for (let i = 0; i < G.rocks.length; i++) if (near(b, G.rocks[i], G.rocks[i].r * 0.92)) { hitRock(i, true); b.t = 0; break; }
+    if (b.t > 0 && G.probe && near(b, G.probe, 12)) { killProbe(200); b.t = 0; }
+  }
+  for (const b of G.ebul) if (b.t > 0 && G.ship && G.ship.safe <= 0 && near(b, G.ship, 8)) { b.t = 0; killShip(); }
+  G.bul = G.bul.filter(b => b.t > 0); G.ebul = G.ebul.filter(b => b.t > 0);
+
+  // collisions
+  for (let i = 0; i < G.rocks.length; i++) {
+    const r = G.rocks[i];
+    if (G.probe && near(r, G.probe, r.r + 9)) { killProbe(0); hitRock(i, false); break; }
+    if (G.ship && G.ship.safe <= 0 && near(r, G.ship, r.r * 0.85 + 7)) { killShip(); hitRock(i, false); break; }
+  }
+  if (G.ship && G.ship.safe <= 0 && G.probe && near(G.ship, G.probe, 18)) { killProbe(0); killShip(); }
+  TOP = Math.max(TOP, G.score);
+
+  if (!G.rocks.length && !G.probe) {
+    if (!G.waveDelay) G.waveDelay = 1.2;
+    G.waveDelay -= dt; if (G.waveDelay <= 0) { G.waveDelay = 0; newWave(); }
+  }
+}
+
+/* ================= Dessin (faisceau + rémanence du phosphore) ================= */
+function wrapped(x, y, r, fn) {               // redessine de l'autre côté quand l'objet chevauche un bord
+  const xs = [x], ys = [y];
+  if (x < r) xs.push(x + W); else if (x > W - r) xs.push(x - W);
+  if (y < r) ys.push(y + H); else if (y > H - r) ys.push(y - H);
+  for (const a of xs) for (const b of ys) fn(a, b);
+}
+function draw(fdt) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+  const tau = 0.012 + opts.persist * 0.11;                       // durée de rémanence
+  ctx.fillStyle = 'rgba(0,0,0,' + Math.min(1, 1 - Math.exp(-fdt / tau)).toFixed(3) + ')';
+  ctx.fillRect(0, 0, cS.width, cS.height);
+  ctx.setTransform(K, 0, 0, K, 0, 0);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.strokeStyle = ctx.fillStyle = '#fff';
+  ctx.lineWidth = Math.max(1.15, 1.3 / K); ctx.lineCap = ctx.lineJoin = 'round';
+
+  ctx.globalAlpha = 0.85;
+  for (const r of G.rocks) wrapped(r.x, r.y, r.r * 1.15, (x, y) => shape(r.pts, x, y, r.a, 1, true));
+  if (G.probe) { const p = G.probe; for (const l of PROBE) poly(l, p.x, p.y, 1); }
+  for (const d of G.debris) { ctx.globalAlpha = Math.min(0.85, d.t); shape(d.p, d.x, d.y, d.a, 1); }
+  const s = G.ship;
+  if (s && (s.safe <= 0 || Math.floor(G.t * 9) % 2)) {
+    ctx.globalAlpha = 0.95;
+    wrapped(s.x, s.y, 14, (x, y) => { shape(SHIP, x, y, s.a, 1, true);
+      if (s.thr && Math.floor(G.t * 30) % 2) shape(FLAME, x, y, s.a, rnd(0.8, 1.25)); });
+  }
+  ctx.globalAlpha = 1;
+  for (const b of G.bul) dot(b.x, b.y, 1.5);
+  for (const b of G.ebul) dot(b.x, b.y, 1.5);
+  for (const p of G.parts) { ctx.globalAlpha = Math.min(1, p.t / p.l * 1.6); dot(p.x, p.y, 1); }
+
+  // affichage : score, record, vies, titre
+  ctx.globalAlpha = 0.8;
+  const sc = String(G.score).padStart(2, '0');
+  text(sc, 40 + textW('00000', 3.2) - textW(sc, 3.2), 22, 3.2);
+  const top = String(TOP); text(top, (W - textW(top, 1.8)) / 2, 22, 1.8);
+  for (let k = 0; k < Math.min(G.lives - (s ? 1 : 0), 6); k++) shape(SHIP, 48 + k * 17, 62, -Math.PI / 2, 0.85, true);
+  if (opts.title) { ctx.globalAlpha = 0.55; text('STEROIDES', (W - textW('STEROIDES', 1.6)) / 2, H - 24, 1.6); }
+  if (G.over > 0) { ctx.globalAlpha = 0.9; text('GAME OVER', (W - textW('GAME OVER', 4)) / 2, H / 2 - 12, 4); }
+
+  for (const b of blurC) { b.x.globalCompositeOperation = 'copy'; b.x.filter = 'blur(' + b.r.toFixed(2) + 'px)';
+    b.x.drawImage(cS, 0, 0, b.c.width, b.c.height); }
+}
+
+function render(time) {
+  [cS, blurC[0].c, blurC[1].c].forEach((s, i) => { gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, tex[i]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, s); });
+  gl.viewport(0, 0, cv.width, cv.height); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.viewport(rect[0], rect[1], rect[2], rect[3]);
+  gl.uniform4f(U.uRect, rect[0], rect[1], rect[2], rect[3]);
+  gl.uniform1f(U.uBright, opts.bright); gl.uniform1f(U.uHalo, opts.halo); gl.uniform1f(U.uCurv, opts.curv);
+  gl.uniform1f(U.uRefl, opts.refl); gl.uniform1f(U.uTime, time % 1000);
+  gl.uniform3f(U.uCol, opts.col[0], opts.col[1], opts.col[2]);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+/* ================= Boucle ================= */
+let last = performance.now(), acc = 0;
+function frame(now) {
+  const fdt = Math.min(0.1, (now - last) / 1000); last = now;
+  acc += fdt * opts.speed;
+  const STEP = 1 / 120;
+  while (acc >= STEP) { update(STEP); acc -= STEP; }
+  draw(fdt); render(now / 1000);
+  requestAnimationFrame(frame);
+}
+let rz; addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(setupMode, 200); });
+setupMode();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

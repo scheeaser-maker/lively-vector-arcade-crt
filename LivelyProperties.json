@@ -1,0 +1,16 @@
+{
+  "affichage": {
+    "type": "dropdown",
+    "text": "Affichage",
+    "items": ["Étiré sur tout l'écran", "Centré (écran de borne 4:3)"],
+    "value": 0
+  },
+  "luminosite": { "type": "slider", "text": "Luminosité", "min": 10, "max": 200, "step": 1, "value": 100 },
+  "halo": { "type": "slider", "text": "Halo lumineux", "min": 0, "max": 200, "step": 1, "value": 100 },
+  "remanence": { "type": "slider", "text": "Rémanence du phosphore (traînées)", "min": 0, "max": 100, "step": 1, "value": 50 },
+  "courbure": { "type": "slider", "text": "Courbure du tube", "min": 0, "max": 100, "step": 1, "value": 50 },
+  "couleurTrace": { "type": "color", "text": "Couleur du tracé", "value": "#DBEDFF" },
+  "reflet": { "type": "checkbox", "text": "Reflet sur la vitre", "value": true },
+  "titre": { "type": "checkbox", "text": "Afficher le titre en bas de l'écran", "value": true },
+  "vitesse": { "type": "slider", "text": "Vitesse du jeu", "min": 25, "max": 200, "step": 1, "value": 100 }
+}
